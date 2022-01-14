@@ -1,0 +1,1831 @@
+---
+title: "Predict Sale Price of Houses in Ames, Iowa"
+author: "Abigail Seeger"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    highlight: tango
+    number_sections: yes
+    theme: paper
+    toc: yes
+    toc_collapsed: yes
+    toc_depth: 4
+    toc_float: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+---
+
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(message=FALSE, warning = FALSE,
+tidy.opts=list(width.cutoff=70),tidy=TRUE, cache = TRUE)
+```
+
+```{r load-packages}
+library(dplyr)
+library(FNN)
+library(ggplot2)
+library(ggcorrplot)
+library(leaps)
+library(class)
+library(glmnet)
+library(knitr)
+library(caret)
+library(Rfast)
+library(MASS)
+library(stringr)
+library(tree)
+library(randomForest)
+library(gbm)
+library(gam)
+library(forcats)
+```
+
+# Introduction
+
+The Ames Housing Dataset, compiled by Dean De Cock, describes nearly every aspect of residential houses sold in Ames, Iowa from 2006 to 2010. The data offers insights into how certain qualities of real estate property impact sale price.
+
+Here, we use multiple machine learning techniques to ultimately create a model that is able to accurately predict the sale price of houses in Ames, Iowa. 
+
+The data has the following predictors:
+
+```{r colnames}
+train <- read.csv("train.csv", header = TRUE)[,-1]
+colnames(train)
+```
+Clearly, complex models can be created using these 79 predictors and the SalePrice response variable. Because of the sheer size of the dataframe, I will not describe each of the predictors. However, a detailed description of each of available on [Kaggle](https://www.kaggle.com/c/house-prices-advanced-regression-techniques/data) in data_description.txt.
+
+# Raw Data 
+
+First, take a look at the raw data:
+
+```{r dim-train}
+dim(train)
+```
+There are 1,460 observations in the training set. There are 79 predictors and 1 response variable. 
+
+Next, get an idea of where there is missing data. Filter to only show the predictors with at least one NA. 
+
+```{r na-count}
+na.temp <- apply(apply(train, 2, is.na), 2, sum)
+na.temp[na.temp != 0]
+```
+
+So, there seem to be some predictors with a lot of missing data, notably Alley (1369 missing values), PoolQC (1453 missing values), Fence (1179 missing values), adn MiscFeatures (1406 missing values).
+
+Upon investigations, these values aren't missing. Instead, these features don't apply to these houses. For example, many houses don't have alley access or a pool, yet instead of encoding these as "No Alley" or "No Pool", the data was encoded as NA. This will be addressed during the data cleaning step.
+
+To get a better idea of the data, investigate the data type of each column.
+
+```{r str-train}
+str(train)
+```
+
+So, it looks like there's a good mix of numeric and character data types. There are 20 continuous variables, 14 discrete variables, 23 nominal variables, and 23 ordinal variables. 
+
+# Data Cleaning
+
+## Create clean.pipeline
+
+Read in the un-cleaned data.
+
+```{r load-unclean-data}
+###Set seed
+set.seed(42)
+###Remove the columns "ID" columns
+test <- read.csv("test.csv", header = TRUE)[,-1]
+train <- read.csv("train.csv", header = TRUE)[,-1]
+```
+
+Here, create a pipeline to address NA values in the data. Many of the categorical variables are encoded as NA, when in fact they just are missing that "feature". For example, if a house doesn't have a basement, the Basement Quality, Basement Exposure, and Basement Finish Type are all NA. This data isn't missing, there just isn't a basement. Here, replace NA values with what the NA represents; in this case, impute "NoBasement".
+
+
+```{r clean-pipeline}
+clean.pipeline <- function(temp.df){
+  temp.df$Alley[is.na(temp.df$Alley)] <- "noAccess"
+  temp.df$BsmtQual[is.na(temp.df$BsmtQual)] <- "noBasement"
+  temp.df$BsmtCond[is.na(temp.df$BsmtCond)] <- "noBasement"
+  temp.df$BsmtExposure[is.na(temp.df$BsmtExposure)] <- "noBasement"
+  temp.df$BsmtFinType1[is.na(temp.df$BsmtFinType1)] <- "noBasement"
+  temp.df$BsmtFinType2[is.na(temp.df$BsmtFinType2)] <- "noBasement"
+  temp.df$FireplaceQu[is.na(temp.df$FireplaceQu)] <- "noFireplace"
+  temp.df$GarageType[is.na(temp.df$GarageType)] <- "noGarage"
+  temp.df$GarageFinish[is.na(temp.df$GarageFinish)] <- "noGarage"
+  temp.df$GarageQual[is.na(temp.df$GarageQual)] <- "noGarage"
+  temp.df$GarageCond[is.na(temp.df$GarageCond)] <- "noGarage"
+  temp.df$PoolQC[is.na(temp.df$PoolQC)] <- "noPool"
+  temp.df$Fence[is.na(temp.df$Fence)] <- "noFence"
+  return(temp.df)
+}
+
+```
+
+Next, address categorical variables.
+
+* Merge the training and testing sets, because some of the categories are only present in one, but not the other. 
+
+* Use dummyVars to one-hot encode the categorical variables.
+
+* Seperate the training and testing sets. Remove the columns used to distinguish between the sets, as well as the SalePrice column of NA's from the testing set.
+
+```{r one-hot-encoding}
+###Include a SalePrice column in the test set, populated with NA, so I can merge the test and training sets
+temp.test <- clean.pipeline(test)%>%
+  mutate(X = "test")%>%
+  mutate(SalePrice = NA)
+temp.train <- clean.pipeline(train)%>%
+  mutate(X = "train")
+all.tmp <- rbind(temp.test, temp.train)
+dummy.var <- dummyVars("~.", data = all.tmp)
+dummy.merged <- as.data.frame(predict(dummy.var, newdata = all.tmp))
+
+###Seperate the testing and training sets
+test <- dummy.merged%>%
+  filter(Xtest == 1)%>%
+  dplyr::select(-c(Xtest, Xtrain, SalePrice))
+
+train <- dummy.merged%>%
+  filter(Xtrain == 1)%>%
+  dplyr::select(-c(Xtest, Xtrain))
+```
+
+Finally, impute the NA values for the quantitative variables with the median value of the column from the training set. 
+
+```{r impute-missing-values}
+###Impure any missing values with the median of the column
+for(i in 1:ncol(train)){
+  train[is.na(train[,i]), i] <- median(train[,i], na.rm = TRUE)
+}
+```
+
+
+## Correlation
+
+Here, investigate the correlation between predictors to find where we may have multicolinearity. 
+
+First, select only the quantitative predictors. To do this, take advantage of the fact that the qualitative predictors after one-hot encoding can only take 2 unique values: 0 or 1.
+
+```{r find-quantitative}
+quantitative.check <- function(x){
+  return(ifelse(length(unique(x)) == 2, FALSE, TRUE))
+}
+quantitative.variables <- train[, apply(train, 2, quantitative.check)]
+```
+
+Find the correlation between the quantitative predictors:
+
+```{r correlation}
+correlation <- cor(quantitative.variables)
+secondHighest <- function(x){
+  sort(x, partial = length(x)-1)[length(x)-1]
+}
+secondLowest <- function(x){
+  sort(x, partial = 2)[2]
+}
+apply(correlation, 2, secondHighest)
+apply(correlation, 2, secondLowest)
+
+```
+It looks like there are some colinearity issues. I will consider the absolute value of correlations greater than 0.7 to be an issue.
+
+```{r lowest-negative-corr}
+ min(apply(correlation, 2, secondLowest))
+```
+There are no offenders for negative correlation values.
+
+```{r hig-corr-count}
+sum(apply(correlation, 2, secondHighest) > 0.7)
+```
+But, there are 10 predictors that have a positive correlation value greater than 0.7. 
+
+```{r corr-plot}
+col.to.investigate <- colnames(quantitative.variables)[apply(correlation, 2, secondHighest) > 0.7]
+
+correlation.plot.data <- quantitative.variables%>%
+  dplyr::select(col.to.investigate)
+
+ggcorrplot(cor(correlation.plot.data))
+```
+
+So, from looking at the plot, the following predictors are highly correlated:
+
+* GarageCars and GarageArea
+* GarageYrBlt and YearBlt
+* TotalBsmtSF and X1stFlrSF
+* TotRmsAbvGrd and GrLivArea
+
+Based on this, remove the following columns:
+
+* GarageCars
+* GarageYrBlt
+* TotalBsmtSF
+* GrLivArea
+
+```{r remove-columns}
+col.to.remove <- c("GarageCars", "GarageYrBlt", "TotalBsmtSF", "GrLivArea")
+
+train <- train%>%
+  dplyr::select(- c(col.to.remove))
+```
+
+## Transformations 
+
+To start, investigate the distribution of the response variable:
+
+```{r boxplot-saleprice}
+boxplot(train$SalePrice, 
+        main = "Sale Price")
+```
+
+Further investigation shows that while the sale price median value is approximately $200,000, there are some houses that sell for much higher. The sale price has a right skew! Clearly, a log transformation of the sale price is preferred for the model - this transformation appears more normal. 
+
+```{r boxplot-transformed}
+par(mfrow = c(1,2))
+boxplot(train$SalePrice, 
+        main = "Sale Price")
+
+boxplot(log(train$SalePrice), 
+        main = "Log of Sale Price")
+train$SalePrice <- log(train$SalePrice)
+```
+
+Next, investigate the relationships between the predictors and the transformed response, to see if any need to be transformed. The goal is to get a linear relationship between each predictor and the transformed response:
+
+```{r pairs-quantitative}
+pairs(cbind(quantitative.variables[,1:5], train$SalePrice))
+pairs(cbind(quantitative.variables[,6:10], train$SalePrice))
+pairs(cbind(quantitative.variables[,11:15], train$SalePrice))
+pairs(cbind(quantitative.variables[,16:20], train$SalePrice))
+pairs(cbind(quantitative.variables[,21:25], train$SalePrice))
+pairs(cbind(quantitative.variables[,26:30], train$SalePrice))
+pairs(cbind(quantitative.variables[,31:32], train$SalePrice))
+```
+
+Some transformations that need to be undertaken include:
+
+* LotArea
+* LotFrontage
+
+```{r transformed-plots}
+par(mfrow = c(1,2))
+plot(train$SalePrice ~ train$LotArea,
+     xlab = "LotArea",
+     main = "Untransformed")
+plot(train$SalePrice ~ log(train$LotArea),
+     xlab = "LotArea",
+     main = "Transformed")
+
+par(mfrow = c(1,2))
+plot(train$SalePrice ~ train$LotFrontage,
+     xlab = "LotFrontage",
+     main = "Untransformed")
+plot(train$SalePrice ~ log(train$LotFrontage),
+     xlab = "LotFrontage",
+     main = "Transformed")
+
+
+```
+
+
+
+Verify that these transformation all significantly improve the relationship between the predictor and the response:
+
+```{r eval = FALSE, echo = FALSE}
+temp.matrix <- matrix(NA, nrow = 2, ncol = 2)
+temp.var <- c("LotArea",
+                            "LotFrontage"
+                            )
+row.names(temp.matrix) <- temp.var
+colnames(temp.matrix) <- c("Correlation - Untransformed",
+                           "Correlation - Transformed")
+for (i in 1:length(temp.var)){
+  temp.column <- train%>%dplyr::select(temp.var[i])
+  temp.matrix[i, 1] <- cor(train$SalePrice, temp.column)
+}
+
+temp.matrix[1,2] <- cor(train$SalePrice, log(train$LotArea))
+temp.matrix[2,2] <- cor(train$SalePrice, log(train$LotFrontage))
+
+temp.matrix
+```
+
+
+Apply these transformations to the predictor variables:
+
+```{r transform-predictors}
+train$LotArea<- log(train$LotArea)
+train$LotFrontage<- log(train$LotFrontage)
+```
+
+Do the same modifications to the test set: 
+
+```{r modify-test-set}
+tmp.test <- test%>%
+  dplyr::select(-c(col.to.remove))
+###Impute any missing values with the median of the training set set
+for(i in 1:ncol(tmp.test)){
+  tmp.test[is.na(tmp.test[,i]), i] <- median(train[,i], na.rm = TRUE)
+}
+
+tmp.test$LotArea<- log(tmp.test$LotArea)
+tmp.test$LotFrontage<- log(tmp.test$LotFrontage)
+```
+
+Next, it is evident that only 7 houses have a pool area not equal to 0, and 24 houses have a 3 season porch. 
+
+```{r evaluate-pool-porch}
+sum(train$PoolArea != 0)
+sum(train$X3SsnPorch != 0)
+```
+Remove these columns:
+
+```{r remove-columns-2}
+train <- train%>%
+  dplyr::select(-c(PoolArea, X3SsnPorch))
+tmp.test <- tmp.test%>%
+  dplyr::select(-c(PoolArea, X3SsnPorch))
+```
+
+
+Here, engineer a new variable to be the total square footage of the house:
+
+```{r create-totalsf}
+train$totalsf <- train$X2ndFlrSF + train$X1stFlrSF 
+tmp.test$totalsf <- tmp.test$X2ndFlrSF + tmp.test$X1stFlrSF 
+```
+
+Split the training set into train.x for the predictor variables and train.y for the response variable.
+
+```{r final-train-test-split}
+train <- train
+train.x <- train%>%dplyr::select(-c(SalePrice))
+train.y <- train$SalePrice
+test <- tmp.test
+
+rownames(train) <- 1:nrow(train)
+```
+
+## A note on RMSE
+
+In order to compare my estimated cross-validation RMSE values to the Kaggle true errors of the test set, I will use the following formula to calculate cross-validation error:
+
+$$\sqrt{\sum_{i=1}^{N} \frac{(log(Predicted_i) - log(Actual_i))^2}{N}}$$
+
+# KNN Method
+
+## Scale the Data
+
+Initialize a data frame to populate with our summary information:
+
+```{r create-knn-df}
+summary.knn <- data.frame(k = rep(NA, 50),
+                          r2 = rep(NA, 50),
+                          PRESS = rep(NA, 50),
+                          rmse = rep(NA, 50))
+```
+
+Scale the data:
+
+```{r knn-scale}
+train.x.scaled <- as.data.frame(scale(train.x))
+###Scale the test data using the mean and sd of the training data
+tmp.mean <- apply(train.x, 2, mean)
+tmp.sd <- apply(train.x, 2, sd)
+test.scaled <- test
+for (i in 1:ncol(test)){
+  test.scaled[,i] <- (test.scaled[,i] - tmp.mean[i]) / tmp.sd[i]
+}
+test.scaled <- as.data.frame(test.scaled)
+
+
+```
+
+## Build the KNN Model
+
+When no test is supplied to knn.reg, LOOCV is performed! 
+
+```{r build-knn}
+for (i in 1:50){
+  tmp.knn <- knn.reg(train.x.scaled, test = NULL, train.y, k = i)
+  pred.knn <- tmp.knn$pred
+  actual <- train.y
+  rmse.knn <- sqrt(mean(((actual) - (pred.knn))^2))
+  summary.knn[i,1] <- tmp.knn$k
+  summary.knn[i,2] <- tmp.knn$R2Pred
+  summary.knn[i,3] <- tmp.knn$PRESS
+  summary.knn[i,4] <- rmse.knn
+}
+
+cv.rmse.knn <- min(summary.knn$rmse)
+```
+
+```{r knn-plot-cv}
+par(mfrow = c(1,2))
+plot(summary.knn$rmse ~ summary.knn$k,
+     xlab = "Number of Nearest Neighbors",
+     ylab = "RMSE",
+     main = "Scaled KNN LOOCV: RMSE")
+abline(v = which(summary.knn$rmse == min(summary.knn$rmse)), col = "red")
+plot(summary.knn$r2 ~ summary.knn$k,
+     xlab = "Number of Nearest Neighbors",
+     ylab = "R-Squared",
+     main = "Scaled KNN LOOCV: R-Squared")
+abline(v = which(summary.knn$r2 == max(summary.knn$r2)), col = "red")
+```
+
+
+A tuning parameter of 6 minimizes the error and maximizes R-squared. 
+
+Here, use the optimal k of 6.
+
+## Make Predictions 
+
+Now, perform predictions on the test data with k = 6.
+
+```{r knn-pred}
+knn.model <- knn.reg(train = train.x.scaled, 
+        test = test.scaled,
+        y = train.y,
+        k = 6)
+
+knn.pred <- exp(knn.model$pred)
+```
+
+
+# Linear Regression
+
+## Fit a Model - All Predictors
+
+Start with fitting a model with all predictor variables and the transformed response.
+
+```{r linear-model-1}
+train.final <- train
+lm.model.1 <- lm(SalePrice ~ ., data = train.final)
+lm.summary.1 <- summary(lm.model.1)
+lm.summary.1$adj.r.squared
+par(mfrow = c(2,2))
+plot(lm.model.1)
+```
+
+
+Here, we have a really big red flag!! For instances 121, 186, 251, 326, 333, 376, 399, 584, 596, 667, 811, 945, 1004, 1012, 1188, 1231, 1271, 1276, 1299, 1322, 1371, and 1387, I am getting a "not plotting observations with leverage one error".
+
+Upon investigating this, this error will occur if groups have only one member. Look into this:
+
+```{r remove-columns-3}
+temp.matrix <- matrix(data = NA, nrow = 400, ncol = 3)
+colnames(temp.matrix) <- c("Predictor", "Absent", "Present")
+count <- 1 
+for (i in 1:ncol(train.final)){
+  if(length(unique(train.final[,i])) == 2){
+    temp.matrix[count, 1] <- colnames(train.final)[i]
+    temp.matrix[count, 2] <- as.integer(sum(train.final[,i] == 0))
+    temp.matrix[count, 3] <- as.integer(sum(train.final[,i] == 1))
+    count <- count + 1
+  }
+}
+  
+temp.matrix <- na.omit(as.data.frame(temp.matrix))
+
+(temp.matrix %>%
+  dplyr::filter(as.integer(Absent) < 4 | as.integer(Present) < 4))
+
+
+col.to.exclude <- (temp.matrix %>%
+  dplyr::filter(as.integer(Absent) < 4 | as.integer(Present) < 4))$Predictor
+```
+
+So, it looks like many predictors only have one, two, or three instance in some columns. Remove these columns. These predictors will not help us build any model moving forward. 
+
+
+```{r modify-trainforlm}
+train.final <- train.final%>%
+  dplyr::select(-c(col.to.exclude))
+
+test.final <- test%>%
+  dplyr::select(-c(col.to.exclude))
+```
+
+## Model 2
+
+Now, fit the model again, with these predictors removed. 
+
+```{r linear-model-2}
+lm.model.2 <- lm(SalePrice ~ ., data = train.final)
+lm.summary.2 <- summary(lm.model.2)
+lm.summary.2$adj.r.squared
+par(mfrow = c(2,2))
+plot(lm.model.2)
+```
+
+This looks a lot better! But, for some reason 4 instances still have a leverage of 1! 
+
+Remove these, and refit the model:
+
+```{r remove-leverage-one}
+train.final <- train.final[-c(326, 333, 667, 949), ]
+```
+
+## Model 3
+
+Now, fit the model again, with these predictors removed. 
+
+```{r linear-model-3}
+lm.model.3 <- lm(SalePrice ~ ., data = train.final)
+lm.summary.3 <- summary(lm.model.3)
+lm.summary.3$adj.r.squared
+par(mfrow = c(2,2))
+plot(lm.model.3)
+```
+
+
+Here, there are a few points that need to be removed. Namely, 524 and 1299 exceed 3 standard deviations in the standardized residual plot. And, 1299 exceeds 1 Cook's distance in the Residuals vs Leverage plot, further justifying its removal. 
+
+## Model 4
+
+```{r linear-model-4}
+train.final <- train.final[rownames(train.final)!="524", ]
+train.final <- train.final[rownames(train.final)!="1299", ]
+
+lm.model.4 <- lm(SalePrice ~ ., data = train.final)
+lm.summary.4 <- summary(lm.model.4)
+lm.summary.4$adj.r.squared
+par(mfrow = c(2,2))
+plot(lm.model.4)
+```
+
+
+Here, the residual versus fitted plot looks good! It looks like there is equal variance, there is no obvious patterns, and the red, dashed line is essentially at zero.
+
+Similarly, the scale-location plot looks acceptable. There is a slight curve, though I think this is okay.
+
+The one major problem is the normal Q-Q plot. There is obvious deviation in the lower tail. However, the adjusted R squared is improved, and there are no obvious transformations that will improve the model. 
+
+## Interpret Coefficients
+
+Next, interpret some coefficients:
+
+```{r linear-model-interpret}
+lm.model.4$coefficients
+```
+Note that some predictors are NA, because there are linearly dependent on other predictors. For example, totalsf can be expressed as the sum of the square foot of the first and second levels, which is why it's not included in the linear model. 
+
+* When all other variables are held constant, when there is no alley access, the log of the expected sale price of the home decreases by 0.03721 dollars. 
+
+* When all other variables are held constant, when the sale condition is normal, the log of the expected sale price of the home increases by 0.03563939 dollars. 
+
+* When all other variables are held constant, when the number of fireplaces increases by 1, the log of the expected sale price of the home increases by 0.007307410 dollars.
+
+
+## Make Predictions
+
+Next, make predictions on the test set, using all variables. 
+
+Remember, these predictions are of the log of the sale price! So, convert from the log of the sale price to the actual sale price:
+
+```{r linear-model-predict}
+lm.pred.tmp <- predict(lm.model.4, test.final)
+lm.pred <- exp(lm.pred.tmp)
+```
+
+Here, perform ten-fold cross validation to get an estimate of the test error we expect:
+
+```{r warning = FALSE, message = FALSE}
+fold.index <- cut(sample(1:nrow(train.final)), breaks=10, labels=FALSE)
+trainLinear <- train.final
+trainLinear$Fold <- fold.index
+
+MSE.list <- c()
+for(i in 1:10){
+  temp.train <- trainLinear[trainLinear$Fold != i, ]%>%
+    dplyr::select(-c(Fold))
+  
+  temp.test <- trainLinear[trainLinear$Fold == i, ]%>%
+    dplyr::select(-c(Fold, SalePrice))
+  
+  actual <- trainLinear[trainLinear$Fold == i, ]%>%
+    dplyr::select(SalePrice)
+  
+  temp.pred <- predict(lm(SalePrice ~ ., data = temp.train), temp.test) 
+  
+  MSE.list[i] <- sqrt(mean(((temp.pred) - (actual[,1]))^2))
+}
+cv.rmse.linear <- mean(MSE.list)
+```
+
+
+```{r}
+train.rm.out <- train[-c(524, 1299), ]
+```
+
+# Subset Selection
+
+Certainly, this linear model can be improved by performing subset selection. 
+
+Because of the size of the data, I will not conduct an exhaustive search, though I am confident that the Forward and Backyard subset selection will be sufficient. 
+
+
+## Forward Stepwise
+
+```{r forward-subset-selection}
+subset.selection.for <- regsubsets(SalePrice ~ .,data = train.final, nvmax = 150, method = "forward")
+summary.subset.for <- summary(subset.selection.for)
+df <- data.frame(sub = 1:length(summary.subset.for$bic), 
+                 bic = summary.subset.for$bic,  
+                 adjr2 = summary.subset.for$adjr2, 
+                 cp = summary.subset.for$cp)
+par(mfrow = c(1,3))
+plot(df$bic ~ df$sub,
+     type = "l",
+     xlab = "Number of Variables in Model",
+     main = "Forward",
+     ylab = "BIC")
+abline(v = which(df$bic == min(df$bic)), col = "red")
+plot(df$adjr2 ~ df$sub,
+     type = "l",
+     main = "Forward",
+     xlab = "Number of Variables in Model",
+     ylab = "Adjusted R-Squared")
+abline(v = which(df$adjr2 == max(df$adjr2)), col = "red")
+plot(df$cp ~ df$sub,
+     type = "l",
+     main = "Forward",
+     xlab = "Number of Variables in Model",
+     ylab = "Cp")
+abline(v = which(df$cp == min(df$cp)), col = "red")
+```
+
+## Backward Stepwise
+
+```{r backward-subset-selection}
+subset.selection.back <- regsubsets(SalePrice ~ .,data = train.final, nvmax = 300, method = "backward")
+summary.subset.back <- summary(subset.selection.back)
+df <- data.frame(sub = 1:length(summary.subset.back$bic), 
+                 bic = summary.subset.back$bic,  
+                 adjr2 = summary.subset.back$adjr2, 
+                 cp = summary.subset.back$cp)
+par(mfrow = c(1,3))
+plot(df$bic ~ df$sub,
+     type = "l",
+     xlab = "Number of Variables in Model",
+     main = "Backward",
+     ylab = "BIC")
+abline(v = which(df$bic == min(df$bic)), col = "red")
+plot(df$adjr2 ~ df$sub,
+     type = "l",
+     main = "Backward",
+     xlab = "Number of Variables in Model",
+     ylab = "Adjusted R-Squared")
+abline(v = which(df$adjr2 == max(df$adjr2)), col = "red")
+plot(df$cp ~ df$sub,
+     type = "l",
+     main = "Backward",
+     xlab = "Number of Variables in Model",
+     ylab = "Cp")
+abline(v = which(df$cp == min(df$cp)), col = "red")
+```
+
+## Cross-Validation
+
+Because forward and backward subset selection methods gave very similar results, I will just use the forward subset selection method in cross-validation.
+
+And, because of the large number of predictors, I will use 5-fold cross validation instead of 10-fold cross validation. 
+
+
+```{r create-predict-subsets}
+predict.regsubsets = function(object,newdata,id,...){
+      form = as.formula(object$call[[2]]) # Extract the formula used when we called regsubsets()
+      mat = model.matrix(form,newdata)    # Build the model matrix
+      coefi = coef(object,id=id)          # Extract the coefficiants of the ith model
+      xvars = names(coefi)                # Pull out the names of the predictors used in the ith model
+      mat[,xvars]%*%coefi               # Make predictions using matrix multiplication
+}
+```
+
+```{r create-bestsubset-df}
+fold.index <- cut(sample(1:nrow(train.final)), breaks=5, labels=FALSE)
+train.final$fold <- fold.index
+
+df <- data.frame(i = rep(NA, 100),
+                 mean_error = rep(NA, 100))
+```
+
+```{r best-subset-cv-error}
+cv.error.best.fit <- rep(0,100)
+for(i in 1:100){   # try different numbers of variables
+  error <- rep(0, 100)
+  for (k in 1:5){
+    tmp.train <- train.final[fold.index != k,]
+    tmp.test <- train.final[fold.index == k,]
+    true.y <- tmp.test[,"SalePrice"]
+    best.fit <- regsubsets(SalePrice ~ ., data = tmp.train, nvmax = 100, method = "forward")
+    pred <- predict(best.fit, tmp.test, id = i)
+    error[k] <- sqrt((mean((pred - true.y)^2)))
+  }
+  cv.error.best.fit[i] <- mean(error)
+}
+
+df <- as.data.frame(cbind(error = cv.error.best.fit, i = 1:100))
+
+plot(df$error ~ df$i,
+     xlab = "Number of Variables in Model",
+     ylab = "RMSE",
+     main = "Subset Selection Via Cross Validation")
+abline(v = which(df$error == min(df$error)), col = "red")
+cv.rmse.bestsubset <- min(df$error)
+train.final <- train.final%>%dplyr::select(-c(fold))
+```
+
+```{r df-to-minimize-error}
+df$i[df$error == min(df$error)]
+```
+
+## Select a Model
+
+The criterion that I considered when selecting my model were adjusted R-squared, BIC, Cp, and cross-validation. Both methods yield a different conclusion for the number of variables to include in the model:
+
+```{r echo = FALSE}
+temp <- data.frame(rbind(
+              BIC = c(49, 49, NA),
+              AdjR = c(119, 126, NA),
+              Cp = c(89, 103, NA),
+              RMSE = c(NA, NA, 98)
+
+              ))
+
+kable(temp,
+      col.names = c("Forward", "Backward", "Cross-Validation"),
+      caption = "Ideal Number of Variables to Include in Model, For a Range of Methods and Criteria")
+```
+
+
+The number of predictors to include in the model differs both by method and metric. 
+
+I chose 98 predictors as the best model, because 98 parameters minimizes the RMSE through cross-validation. 
+
+And, 98 is roughly in between the optimaly number of predictors selected via BIC (49) and the optimal number of predictors selected by Adjusted R-Squared and Cp (between 89 and 126.)
+
+Ultimately, the goal is to minimize RMSE, because our goal is to make accurate predictions. 
+
+## Make Predictions
+
+
+```{r best-subset-predictions}
+regfit.full <- regsubsets(SalePrice ~ . , data = train.rm.out, nvmax = 300, method = "forward")
+test$SalePrice <- rep(0, nrow(test))
+
+library(leaps)
+pred.best.subset <- exp(predict.regsubsets(regfit.full, newdata = test, id = 96))
+coef(regfit.full, 98)
+```
+
+## Interpret Coefficients
+
+Here, interpret the coefficients of the model selected through best-subset:
+
+* Holding all other variables constant, when roof style is flat, the log of the expected sale price increases by 0.09055597 dollars.
+
+* Holding all other variables constant, when the house does not have a paved driveway, the log of the expected sale price decreases by 0.03306086 dollars.
+
+* Holding all other variables constant, when the log of the lot area of the house increases by 1 unit, the log of the expected sale price increases by 0.09430385 dollars.
+
+## CV Error
+
+Use 10-fold cross-validation to find the expected error for the subset that has 96 predictors. 
+
+```{r best-subset-cv-error2}
+fold.index <- cut(sample(1:nrow(train.final)), breaks=10, labels=FALSE)
+trainCV <- train.final
+trainCV$Fold <- fold.index
+
+MSE.list <- c()
+for(i in 1:10){
+  temp.train <- trainCV[trainCV$Fold == i, ]
+  temp.test <- trainCV[trainCV$Fold != i, ]
+  
+  temp.train <- temp.train%>%
+    dplyr::select(-c(Fold))
+  actual <- temp.test$SalePrice
+  
+  temp.test <- temp.test%>%
+    dplyr::select(-c(Fold))
+
+  model <- regsubsets(SalePrice ~ . , data = temp.train, nvmax = 300, method = "forward")
+  
+  temp.pred <- (predict.regsubsets(model, newdata = temp.test, id = 98))
+  
+  MSE.list[i] <- sqrt(mean((actual - temp.pred)^2))
+}
+cv.rmse.bestsubset <- mean(MSE.list)
+```
+
+# Shrinkage Methods
+
+Finally, use both a Lasso and Ridge regression to fit the data. 
+
+## Ridge Regression
+
+```{r ridge-regression}
+train.x <- as.matrix((train.final%>%dplyr::select(-c(SalePrice))))
+train.y <- train.final$SalePrice
+test.x <- as.matrix(test.final)
+
+ridge.mod <- glmnet(train.x, train.y, alpha = 0)  # 0 indicates ridge regression
+cv.out <- cv.glmnet(train.x, train.y, alpha = 0, nfolds = 10)
+plot(cv.out)
+bestlam <- cv.out$lambda.min
+bestlam
+coef(ridge.mod, s = bestlam)
+ridge.pred <- exp(predict(ridge.mod, s = bestlam, newx = test.x))
+cv.rmse.ridge <- sqrt(mean((log(exp(train.y)) - log(exp(predict(cv.out, train.x))))^2))
+```
+
+```{r ridge.cv.error}
+print(cv.rmse.ridge)
+```
+
+The tuning parameter for ridge regression is the minimum lambda, which was chosen through using cross validation.
+
+## Interpret Ridge Coefficients
+
+Here, interpret the coefficients of the model selected through Ridge Regression:
+
+* Holding all other variables constant, when the total square foot increases by 1 unit, the log of the expected sale price increases by 0.0001081563 dollars.
+
+* Holding all other variables constant, when there is no garage, the log of the expected sale price decreases by 0.01323262dollars.
+
+* Holding all other variables constant, when year built increases by 1, the log of the expected sale price increases by 0.0008491660 dollars.
+
+## Lasso Regression
+
+```{r lasso-regression}
+lasso.mod <- glmnet(train.x, train.y, alpha = 1)  # 1 indicates lasso regression
+cv.lasso.out <- cv.glmnet(train.x, train.y, alpha = 1, nfolds = 10)
+pred <- predict(cv.lasso.out, train.x)
+plot(cv.lasso.out)
+bestlam <- cv.lasso.out$lambda.min
+bestlam
+coef(lasso.mod, s = bestlam)
+lasso.pred <- exp(predict(lasso.mod, s = bestlam, newx = test.x))
+cv.rmse.lasso <- as.vector(sqrt(cv.lasso.out$cvm[which(cv.lasso.out$lambda == bestlam)]))
+```
+
+Note that the "long hand" way of finding the RSME yields the same result as taking the square root of the Mean-Squared Error at the best lambda value from the plot above. (This was also the case for the ridge regression).
+
+```{r lasso.cv.error}
+cv.rmse.lasso
+sqrt(cv.lasso.out$cvm[cv.lasso.out$lambda == bestlam])
+```
+
+Once again, the tuning parameter for lasso regression is the minimum lambda,  which was chosen through using cross validation.
+
+
+```{r nonzero-predictors}
+sum(coef(lasso.mod, s = bestlam) == 0)
+```
+
+Through the Lasso regression model, 125 coefficients become zero:
+
+
+Leaving the following 116 coefficients (note that 116 is similar to the number of predictors selected in the Best Subset selection when considering the Cp criteria):
+
+```{r summarize-coefficients}
+length(coef(lasso.mod, s = bestlam)[,1][coef(lasso.mod, s = bestlam)[,1] != 0])
+
+coef(lasso.mod, s = bestlam)[,1][coef(lasso.mod, s = bestlam)[,1] != 0]
+```
+
+## Interpret Lasso Coefficients
+
+Here, interpret the coefficients of the model selected through Lasso Regression:
+
+* Holding all other variables constant, houses that have have a paved driveway increase the log of the expected sale price by 0.01415927 dollars, compared to houses that don't have a paved driveway. 
+
+* Holding all other variables constant, when the number of fireplaces increases by 1, the log of the expected sale price increases by 0.006697782  dollars.
+
+* Holding all other variables constant, when the total square foot increases by 1 unit, the log of the expected sale price increases by 0.0002508128 dollars.
+
+## Model Interpretation
+
+The Lasso model has much better interpretation, because many predictors coefficients become 0, while in the Ridge model the coefficients are all non-zero.
+
+It's easy to interpret variables with a coefficient of 0, because they must not be significant predictors of sale price. But, variables that have a very small coefficient are still included in Ridge models despite likely not being significant predictors of sale price. 
+
+
+
+# Regression Tree
+
+Initially, I was running into problems building the regression tree. Ultimately, there were problems with the column names with contained certain characters (., &, 1, 2, 3, 5). So, I removed these characters from the column names in the following loop:
+
+```{r rename-columns}
+colNames <- colnames(train.final)
+for (i in 1:length(colNames)){
+  if(str_detect(colNames[i], " ") == TRUE){
+    colNames[i] <- str_replace(colNames[i], " ", "")}
+  if(str_detect(colNames[i], ".") == TRUE){
+      colNames[i] <- str_replace(colNames[i], "\\.", "")
+  }
+  if(str_detect(colNames[i], "&") == TRUE){
+      colNames[i] <- str_replace(colNames[i], "\\&", "")
+  }
+
+  if(str_detect(colNames[i], "1") == TRUE){
+      colNames[i] <- str_replace(colNames[i], "1", "One")
+  }
+  if(str_detect(colNames[i], "2") == TRUE){
+      colNames[i] <- str_replace(colNames[i], "2", "Two")
+  }
+  if(str_detect(colNames[i], "3") == TRUE){
+      colNames[i] <- str_replace(colNames[i], "3", "Three")
+  }
+  if(str_detect(colNames[i], "5") == TRUE){
+      colNames[i] <- str_replace(colNames[i], "5", "Five")
+  }
+}
+
+colnames(train.final) <- colNames
+colnames(train.final)[2] <- "MSZoningCAll"
+
+colnames(test.final) <- colNames[colNames != "SalePrice"]
+colnames(test.final)[2] <- "MSZoningCAll"
+```
+
+## Build the Model
+
+```{r regression-tree}
+tree1 <-tree(SalePrice ~ ., data = train.final)
+```
+
+## Intepretation 
+
+```{r plot-regression-tree}
+plot(tree1)
+text(tree1, pretty = 0)
+```
+
+```{r summary-regression-tree}
+summary(tree1)
+```
+
+So, it looks like the variables used to "grow" the tree are OverallQuality, totalsf, CentralAirY, First Floor Square Feet, and Residential Medium Density Zoning.
+
+The most important predictor of Sale Price is Overall Quality; houses that have an overall quality greater than 6.5 tend to have a higher Sale Price than houses with a lower overaLl quality. 
+
+The houses that sold for the most money have an overall quality greater than 8.5. 
+
+The houses that sold for the least money have an overall quality less than 6.5, have total square feet less than 1378.5, and do not have central air. 
+
+
+## Select the Optimal Number of Nodes
+
+```{r prune-regression-tree}
+cv.tree1 <-cv.tree(tree1, FUN = prune.tree, K = 10)
+par(mfrow =c(1,2))
+plot(cv.tree1$size, cv.tree1$dev, type = "b")
+plot(cv.tree1$k, cv.tree1$dev, type = "b")
+```
+
+
+```{r best-size-regression-tree}
+best.size <- cv.tree1$size[which.min(cv.tree1$dev)]
+best.size
+```
+
+I chose the tuning parameter through cross-validation. The best size selected through cross-validation is 9. This is the same size as the initial tree that we "grew", so the pruned tree will be exactly the same as the initial model:
+
+```{r evaluate-pruned-tree }
+prune.tree1 <-prune.tree(tree1, best = best.size)
+plot(prune.tree1)
+text(prune.tree1, pretty = 0)
+```
+
+## Estimated Test Error
+
+Here, use 10-fold cross validation to estimate the test RMSE:
+
+```{r regression-tree-cv-error}
+fold.index <- cut(sample(1:nrow(train.final)), breaks=10, labels=FALSE)
+trainCV <- train.final
+trainCV$Fold <- fold.index
+MSE.list <- c()
+
+for(i in 1:10){
+  temp.train <- trainCV[trainCV$Fold != i, ]%>%dplyr::select(-c(Fold))
+  temp.test <- trainCV[trainCV$Fold == i, ]%>%dplyr::select(-c(Fold, SalePrice))
+  actual <- trainCV[trainCV$Fold == i, ]%>%dplyr::select(SalePrice)
+  temp.pred <- predict(tree(SalePrice ~ ., data = temp.train), temp.test)
+  MSE.list[i] <- sqrt(mean(((actual[,1]) - (temp.pred))^2))
+}
+cv.rmse.regression.tree <- mean(MSE.list)
+```
+
+Finally, make predictions on the regression tree. 
+
+```{r regression-tree-predictions }
+regression.tree.predictions <- exp(predict(tree1, test.final))
+```
+
+
+# Random Forest
+
+## Create the Model
+
+First, create the model using the default number of trees (500) and the maximum predictors to try at each node of $\frac{p}{3}$.
+
+```{r build-random-forest}
+rf.1 <- randomForest(SalePrice ~ ., 
+                     data = train.final, 
+                     mtry = ceiling((ncol(train.final) - 1)/3), importance = TRUE)
+```
+
+## Parameter Tuning
+
+But, in the text book, they recommend two different values of mtry: both $\sqrt p$ and $\frac{p}{3}$. Use 5-fold cross validation to find the best parameter to use:
+
+```{r rf-mtry-tuning}
+rf.train <- train.final
+fold.index <- cut(sample(1:nrow(rf.train)), breaks=5, labels=FALSE)
+rf.train$fold.index <- fold.index
+
+count <- 1
+matrix <- matrix(data = NA, nrow = 2, ncol = 2)
+
+for (method in c("square.root", "p/3")){
+    temp.vect <- c()
+    temp.mtry <- ifelse(method == "square.root", sqrt(ncol(train.final) -1), ((ncol(train.final) - 1) / 3))
+    for (i in 1:5){
+      temp.train <- rf.train%>%
+        dplyr::filter(fold.index != i)%>%
+        dplyr::select(-c(fold.index))
+      temp.test <- rf.train%>%
+        dplyr::filter(fold.index == i)%>%
+        dplyr::select(-c(fold.index, SalePrice))
+      actual <- rf.train%>%
+        dplyr::filter(fold.index == i)%>%
+        dplyr::select(SalePrice)
+        
+      
+      temp.model <- randomForest(SalePrice ~ ., 
+                     data = temp.train, 
+                     mtry = temp.mtry,
+                     ntree = 500)
+      
+      predict <- predict(temp.model, temp.test)
+      
+      temp.vect[i] <- sqrt(mean(actual[,1] - predict)^2)
+      
+    }
+    matrix[count, 1] <- method
+    matrix[count, 2] <- mean(temp.vect)
+    count <- count + 1
+}
+
+matrix
+```
+
+
+So, using the number of trees, the $\frac{p}{3}$ method yields a slightly lower RMSE.
+
+Now, use a grid search to select the optimal number of trees, using $\frac{p}{3}$ as mtry:
+
+```{r rf-ntree-tuning}
+rf.train <- train.final
+fold.index <- cut(sample(1:nrow(rf.train)), breaks=5, labels=FALSE)
+rf.train$fold.index <- fold.index
+
+count <- 1
+matrix <- matrix(data = NA, nrow = 10, ncol = 2)
+
+for (temp.tree in seq(50, 500, 50)){
+    temp.vect <- c()
+    for (i in 1:5){
+      temp.train <- rf.train%>%
+        dplyr::filter(fold.index != i)%>%
+        dplyr::select(-c(fold.index))
+      temp.test <- rf.train%>%
+        dplyr::filter(fold.index == i)%>%
+        dplyr::select(-c(fold.index, SalePrice))
+      actual <- rf.train%>%
+        dplyr::filter(fold.index == i)%>%
+        dplyr::select(SalePrice)
+        
+      
+      temp.model <- randomForest(SalePrice ~ ., 
+                     data = temp.train, 
+                     mtry = 84,
+                     ntree = temp.tree)
+      
+      predict <- predict(temp.model, temp.test)
+      
+      temp.vect[i] <- sqrt(mean(actual[,1] - predict)^2)
+      
+    }
+    matrix[count, 1] <- temp.tree
+    matrix[count, 2] <- mean(temp.vect)
+    count <- count + 1
+}
+
+matrix
+plot(matrix[,2] ~ matrix[,1],
+     xlab = "Number of Trees",
+     ylab = "RMSE")
+```
+
+Evident in the plot, there is no obvious relationship between number of trees in the model and RMSE, which is unexpected. 
+
+So, moving forward, I'll use the default number of trees: 500. Further, the random forest with 500 trees has a relatively low RMSE, and using more trees would take a long time to compute. 
+
+## Estimated Test Error
+
+Here, use 5-fold cross validation to estimate the test RMSE:
+
+```{r rf-cv-error}
+fold.index <- cut(sample(1:nrow(train.final)), breaks=5, labels=FALSE)
+trainCV <- train.final
+trainCV$Fold <- fold.index
+MSE.list <- c()
+
+for(i in 1:5){
+  temp.train <- trainCV[trainCV$Fold != i, ]%>%
+    dplyr::select(-c(Fold))
+  temp.test <- trainCV[trainCV$Fold == i, ]%>%
+    dplyr::select(-c(Fold, SalePrice))
+  
+  actual <- trainCV[trainCV$Fold == i, ]%>%
+    dplyr::select(SalePrice)
+  
+  temp.pred <- predict(randomForest(SalePrice ~ ., data = temp.train, mtry = ceiling((ncol(trainCV) - 1)/3), importance = TRUE), temp.test)  
+  
+  MSE.list[i] <- sqrt(mean(((temp.pred) - (actual[,1]))^2))
+}
+cv.rmse.random.forest <- mean(MSE.list)
+```
+
+## Interpretation
+
+Note, I only selected the ten most important predictors to display.
+
+```{r rf-interpretation}
+varImpPlot(rf.1, n.var = 10)
+```
+
+So, the most important predictors in terms of node purity are overally quality, total square feet, year built, and garage area. 
+
+The most important predictors in terms of %IncMSE are total square feet, the total square feet of the finished basement, and overall quality. 
+
+The regression tree had many of the same important predictors. Notably, however, the regression tree included central air, while this predictor is not the in top ten most important by either the %IncMSE or Node Purity metrics. 
+
+
+## Predictions
+
+Make predictions:
+
+```{r rf-predictions}
+random.forest.pred <- data.frame(SalePrice = predict(rf.1, test.final))
+```
+
+# Bagging
+
+## Build the Model
+
+Bagging is simply a random forest, with mtry set to the number of predictors. 
+
+```{r build-bagging-model}
+predictors <- ncol(train.final) - 1
+
+bag.1 <-randomForest(SalePrice ~., data = train.final, mtry = predictors, importance = TRUE)
+
+bag.1
+```
+
+## Parameter Tuning
+
+Now, I will choose the tuning parameter to use in this model: the number of trees. This is very similar to what I did for Random Forest. 
+
+```{r ntrees-bagging-model}
+bagging.train <- train.final
+fold.index <- cut(sample(1:nrow(bagging.train)), breaks=5, labels=FALSE)
+bagging.train$fold.index <- fold.index
+
+count <- 1
+matrix <- matrix(data = NA, nrow = 5, ncol = 2)
+
+for (temp.tree in seq(100, 500, 100)){
+    temp.vect <- c()
+    for (i in 1:5){
+      temp.train <- bagging.train%>%
+        dplyr::filter(fold.index != i)%>%
+        dplyr::select(-c(fold.index))
+      temp.test <- bagging.train%>%
+        dplyr::filter(fold.index == i)%>%
+        dplyr::select(-c(fold.index, SalePrice))
+      actual <- bagging.train%>%
+        dplyr::filter(fold.index == i)%>%
+        dplyr::select(SalePrice)
+        
+      
+      temp.model <- randomForest(SalePrice ~ ., 
+                     data = temp.train, 
+                     mtry = (ncol(bagging.train) - 2),
+                     ntree = temp.tree)
+      
+      predict <- predict(temp.model, temp.test)
+      
+      temp.vect[i] <- sqrt(mean(actual[,1] - predict)^2)
+      message(i)
+    }
+    matrix[count, 1] <- temp.tree
+    matrix[count, 2] <- mean(temp.vect)
+    count <- count + 1
+}
+
+matrix
+plot(matrix[,2] ~ matrix[,1],
+     xlab = "Number of Trees",
+     ylab = "RMSE")
+```
+
+
+Similar to the random forest, there is surprisingly no pattern in the error plot. So, I will use the default number of trees.
+
+
+## Interpretation
+
+Note that I only display the 10 most important predictors, so the plot can actually be interpreted. 
+
+```{r interpret-bagging-model}
+varImpPlot(bag.1, n.var = 10)
+```
+
+So, the most important predictors in terms of node purity are overall quality, total square feet, first floor square feet, and second floor square feet. Note that total square feet is the sum of the first and second floor square feet, so I suspect that these predictors will be highly correlated. However, tree based methods are robust to multicollinearity, so this won't be a problem moving forward. 
+
+The most important predictors in terms of %IncMSE are overall quality, total square feet, year built, and square feet of finished basement.
+
+These predictors are very similar to the ones in the random forest model. 
+
+## Estimated Test Error
+
+```{r bagging-cv-error}
+fold.index <- cut(sample(1:nrow(train.final)), breaks=5, labels=FALSE)
+trainBag <- train.final
+trainBag$Fold <- fold.index
+MSE.list <- c()
+
+for(i in 1:5){
+  temp.train <- trainBag[trainBag$Fold != i, ]%>%
+    dplyr::select(-c(Fold))
+  temp.test <- trainBag[trainBag$Fold == i, ]%>%
+    dplyr::select(-c(Fold, SalePrice))
+  
+  actual <- trainBag[trainBag$Fold == i, ]%>%
+    dplyr::select(SalePrice)
+  
+  temp.model <- randomForest(SalePrice ~ ., 
+                     data = temp.train, 
+                     mtry = (ncol(bagging.train) - 2))
+  
+  temp.pred <- predict(temp.model, temp.test)  
+  
+  MSE.list[i] <- sqrt(mean(((temp.pred) - (actual[,1]))^2))
+}
+cv.rmse.bagging <- mean(MSE.list)
+```
+
+## Predictions
+
+```{r predict-bagging-model}
+bag.predictions <- predict(bag.1, test.final)
+```
+
+# Boosting
+
+## Build Model
+
+```{r build-boosting-model}
+boost.1<-gbm(SalePrice~. , data = train.final, distribution = "gaussian", shrinkage = 0.01, n.tree = 5000, interaction.depth = 4)
+```
+
+## Parameter Tuning
+
+Here, use cross-fold validation to select the best number of trees to use in the model.
+
+```{r tune-boosting-model}
+boost.cv <-gbm(SalePrice ~. , data = train.final, distribution = "gaussian", shrinkage = 0.01, n.tree = 5000, interaction.depth = 4, cv.folds = 10)
+boost.cv
+```
+
+Here is the optimal number of trees which I will use in the model:
+
+```{r ntree-boost}
+which.min(boost.cv$cv.error)
+```
+
+
+## Refit Model
+
+```{r refit-boosting-model}
+boost.2<-gbm(SalePrice~. , data = train.final, distribution = "gaussian", shrinkage = 0.01, n.tree = which.min(boost.cv$cv.error), interaction.depth = 4)
+```
+
+## Interpretation
+
+```{r interpret-boosting-model}
+summary.gbm(boost.2, plotit = FALSE)
+```
+
+So, the most important predictors are overall quality, total square feet, first floor square feet, square feet of finished basement, and garage area.
+
+Here, plot only the top ten most important predictors:
+
+
+```{r plot-boosting-model}
+plot.data <- summary.gbm(boost.2)[1:10, ]
+
+plot.data %>%
+  mutate(var = fct_reorder(var, rel.inf)) %>%
+  ggplot(aes(x = var, y = rel.inf)) +
+    geom_bar(stat="identity", fill = "green", alpha=.6, width=.4) +
+    coord_flip() +
+    xlab("") +
+    ylab("Relative Influence")+
+    theme_bw()
+```
+
+## Estimated Test Error
+
+Here, use 10-fold cross validation to estimate the test RMSE.
+
+Note that I initially ran into an error, because when I split the data into 10 partitions, some of the training sets only had one unique value in a predictor column.
+
+So, to avoid this error, I filtered to only used the columns where both the testing and training set had at least 2 unique values in each predictor column. While this may give an inaccurate representation of test error, this was the only method I could get the loop to actually work. 
+
+```{r boosting-cv-error}
+trainBoost <- train.final
+fold.index <- cut(sample(1:nrow(trainBoost)), breaks=10, labels=FALSE)
+trainBoost$Fold <- fold.index
+
+MSE.list <- c()
+
+for(i in c(1)){
+  temp.train <- trainBoost[trainBoost$Fold != i, ]%>%
+    dplyr::filter(Fold != i)%>%
+    dplyr::select(-c(Fold))
+  
+  temp.test <- trainBoost%>%
+    dplyr::filter(Fold == i)%>%
+    dplyr::select(-c(Fold))
+  
+  unique.vect1 <- c()
+  for(j in 1:ncol(temp.test)){
+    unique.vect1[j] <- length(unique(temp.test[,j]))
+  }
+  
+    
+  unique.vect2 <- c()
+  for(k in 1:ncol(temp.train)){
+    unique.vect2[k] <- length(unique(temp.train[,k]))
+  }
+  
+  include <- intersect(colnames(temp.test)[unique.vect1 != 1],
+                       colnames(temp.train)[unique.vect2 != 1])
+                       
+  
+  temp.train <- temp.train%>%
+    dplyr::select(c(include, "SalePrice"))
+  
+  actual <- temp.test%>%
+    dplyr::select(SalePrice)
+  
+  temp.test <- temp.test%>%
+    dplyr::select(include)%>%
+    dplyr::select(-c(SalePrice))
+  
+
+  
+  temp.boost <-gbm(SalePrice ~. , data = temp.train, distribution = "gaussian", shrinkage = 0.01, n.tree = which.min(boost.cv$cv.error), interaction.depth = 4)
+  
+  temp.pred <- predict(temp.boost, newdata = temp.test, n.trees = which.min(temp.boost$cv.error))
+  
+  MSE.list[i] <- sqrt(mean((log(temp.pred) - log(actual[,1]))^2))
+}
+cv.rmse.boost <- mean(MSE.list)
+cv.rmse.boost
+```
+
+## Predictions
+
+
+```{r boosting-predictions}
+boost.pred <- predict(boost.cv, newdata = test.final, n.trees =which.min(boost.cv$cv.error))
+```
+
+# GAM
+
+## Build a Model
+
+First, I will use the same predictors as indicated in the best subset selection.
+
+I tried to create a loop to try different degrees of freedom, and to avoid manually typing in the equation for each model, but that proved to be a challenge.
+
+So, I first converted the binary 0, 1 values to factors. Then, I included the factors in a string. I added to the string each quantitative variable, in the form s(colname, j). 
+
+Now, all I have to do is copy paste this expression in a loop with varying degrees of freedom to investigate the best degrees of freedom to use!
+
+```{r initial-gam}
+best.fit <- regsubsets(SalePrice ~ ., data = train.final, nvmax= 150, method = "forward")
+gam.to.include <- row.names(as.data.frame(coef(best.fit, 98)))
+gam.to.include <- gam.to.include[gam.to.include != "(Intercept)"]
+
+train.gam <- train.final%>%
+  dplyr::select(c(gam.to.include, "SalePrice"))
+
+for(i in 1:ncol(train.gam)){
+  if(unique(train.gam[,i])[1] %in% c(0, 1)){
+    train.gam[,i] <- as.factor(train.gam[,i])
+  }
+}
+expression <- c()
+for(i in 1:ncol(train.gam)){
+  if(is.numeric(train.gam[,i]) & colnames(train.gam)[i] != "SalePrice"){
+    expression <- paste(expression, " s(", colnames(train.gam)[i], ", j) +", sep = "")
+  }
+}
+
+for (i in 1:ncol(train.gam)){
+  if(is.factor(train.gam[,i])){
+    if(i == (ncol(train.gam) - 2)){
+      expression <- paste(expression, colnames(train.gam[i]), sep = " ")
+          }
+      else{
+      expression <- paste(expression, colnames(train.gam[i]), "+", sep = " ")
+      }
+  }
+}
+
+
+final.expression <- paste("SalePrice ~", expression)
+final.expression
+
+```
+Here, I will create a matrix of p-values. For degrees of freedom from 2 to 8, I will populate the matrix with p-values of the nonparametric terms for each of the quantitative predictors. 
+
+```{r p-values-gam}
+p.value.matrix <- matrix(data= NA, nrow = 9, ncol = 7)
+row.names(p.value.matrix) = c("Lot Frontage", 
+                              "LotArea",
+                              "YearRemodAdd",
+                              "First Floor SF",
+                              "Second Floor SF",
+                              "Bedrooms Above Ground",
+                              "Total Rooms Above Ground",
+                              "YrSold",
+                              "TotalSF")
+colnames(p.value.matrix) <- c(2:8)
+
+for (j in 2:8){
+  temp.model <- gam(SalePrice ~  s(LotFrontage, j) + s(LotArea, j) + s(YearRemodAdd, j) + s(XOnestFlrSF, j) + s(XTwondFlrSF, j) + s(BedroomAbvGr, j) + s(TotRmsAbvGrd, j) + s(YrSold, j) + s(totalsf, j) + MSZoningCAll + MSZoningRL + StreetGrvl + AlleyGrvl + LotShapeIRThree + NeighborhoodBlmngtn + NeighborhoodBrDale + NeighborhoodEdwards + NeighborhoodGilbert + NeighborhoodMeadowV + NeighborhoodMitchel + NeighborhoodNoRidge + NeighborhoodNPkVill + NeighborhoodOldTown + NeighborhoodSawyer + NeighborhoodSomerst + NeighborhoodStoneBr + NeighborhoodSWISU + NeighborhoodTimber + ConditionOneNorm + ConditionOnePosA + ConditionOneRRAn + ConditionOneRRNn + ConditionTwoNorm + BldgTypeTwofmCon + BldgTypeDuplex + RoofStyleFlat + RoofStyleGable + RoofMatlCompShg + RoofMatlTarGrv + RoofMatlWdShake + RoofMatlWdShngl + ExteriorOnestWdSdng + ExteriorTwondAsbShng + ExteriorTwondBrkFace + ExteriorTwondCmentBd + ExteriorTwondHdBoard + ExteriorTwondPlywood + ExteriorTwondWdSdng + ExterCondFa + FoundationBrkTil + FoundationPConc + BsmtCondGd + BsmtExposureAv + BsmtExposureGd + BsmtFinTypeOneALQ + BsmtFinTypeOneBLQ + BsmtFinTypeTwoALQ + BsmtFinSFTwo + HeatingGasA + HeatingGrav + HeatingQCEx + ElectricalFuseF + HalfBath + KitchenAbvGr + KitchenQualFa + FunctionalMajTwo + FunctionalMod + FireplaceQuPo + GarageTypeTwoTypes + GarageTypeBasment + GarageTypeBuiltIn + GarageTypeDetchd + GarageFinishFin + GarageQualTA + GarageCondFa + GarageCondTA + PavedDriveN + EnclosedPorch + ScreenPorch + FenceGdWo + SaleTypeCWD + SaleTypeNew + SaleConditionAlloca + StreetPave + LandContourLvl + LotConfigInside + LandSlopeSev + BldgTypeTwnhsE + HouseStyleSLvl + MasVnrTypeStone + BsmtQualTA + BsmtFinTypeOnenoBasement + CentralAirY + FireplaceQuTA + GarageTypenoGarage + GarageQualnoGarage + GarageCondnoGarage + FencenoFence, data = train.final)
+  
+  temp.summary <- summary(temp.model)
+  p.value.matrix[,(j -1)] <- temp.summary$anova[2:10, 3]
+}
+```
+
+
+```{r print-p-value-matrix}
+p.value.matrix < 0.05
+```
+
+Some notes based on this p-value matrix:
+
+Total Rooms Above Ground is never significantly transformed.
+
+Generally, the significance of the nonparametric terms in the model changes based on the degrees of freedom.
+
+Now, to find the best degrees of freedom, I will build 7 models, with degrees of freedom 2 to 8.
+
+For each model, I will remove the natural spline term from the quantitative predictors where the nonparametric effect is not significant.
+
+Finally, I will perform 10-fold cross validation to estimate test error. I will choose the model that minimizes test error. 
+
+```{r include-fold-column-gam}
+gam.train <- train.final
+fold.index <- cut(sample(1:nrow(gam.train)), breaks=10, labels=FALSE)
+gam.train$Fold <- fold.index
+MSE.list <- c()
+```
+
+
+### 2 Degrees of Freedom
+
+This has no nonparametric terms added. 
+
+```{r gam-2-df}
+MSE.list.2.df <- c()
+for(i in 1:10){
+  temp.train <- gam.train[gam.train$Fold != i, ]%>%dplyr::select(-c(Fold))
+  temp.test <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(-c(Fold, SalePrice))
+  actual <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(SalePrice)
+  temp.model.2.df <- gam(SalePrice ~  LotFrontage + LotArea + YearRemodAdd + XOnestFlrSF + XTwondFlrSF + BedroomAbvGr+ TotRmsAbvGrd + YrSold + totalsf + MSZoningCAll + MSZoningRL + StreetGrvl + AlleyGrvl + LotShapeIRThree + NeighborhoodBlmngtn + NeighborhoodBrDale + NeighborhoodEdwards + NeighborhoodGilbert + NeighborhoodMeadowV + NeighborhoodMitchel + NeighborhoodNoRidge + NeighborhoodNPkVill + NeighborhoodOldTown + NeighborhoodSawyer + NeighborhoodSomerst + NeighborhoodStoneBr + NeighborhoodSWISU + NeighborhoodTimber + ConditionOneNorm + ConditionOnePosA + ConditionOneRRAn + ConditionOneRRNn + ConditionTwoNorm + BldgTypeTwofmCon + BldgTypeDuplex + RoofStyleFlat + RoofStyleGable + RoofMatlCompShg + RoofMatlTarGrv + RoofMatlWdShake + RoofMatlWdShngl + ExteriorOnestWdSdng + ExteriorTwondAsbShng + ExteriorTwondBrkFace + ExteriorTwondCmentBd + ExteriorTwondHdBoard + ExteriorTwondPlywood + ExteriorTwondWdSdng + ExterCondFa + FoundationBrkTil + FoundationPConc + BsmtCondGd + BsmtExposureAv + BsmtExposureGd + BsmtFinTypeOneALQ + BsmtFinTypeOneBLQ + BsmtFinTypeTwoALQ + BsmtFinSFTwo + HeatingGasA + HeatingGrav + HeatingQCEx + ElectricalFuseF + HalfBath + KitchenAbvGr + KitchenQualFa + FunctionalMajTwo + FunctionalMod + FireplaceQuPo + GarageTypeTwoTypes + GarageTypeBasment + GarageTypeBuiltIn + GarageTypeDetchd + GarageFinishFin + GarageQualTA + GarageCondFa + GarageCondTA + PavedDriveN + EnclosedPorch + ScreenPorch + FenceGdWo + SaleTypeCWD + SaleTypeNew + SaleConditionAlloca + StreetPave + LandContourLvl + LotConfigInside + LandSlopeSev + BldgTypeTwnhsE + HouseStyleSLvl + MasVnrTypeStone + BsmtQualTA + BsmtFinTypeOnenoBasement + CentralAirY + FireplaceQuTA + GarageTypenoGarage + GarageQualnoGarage + GarageCondnoGarage + FencenoFence, data = temp.train)
+  
+  temp.pred <- predict.lm(temp.model.2.df, temp.test)
+  MSE.list.2.df[i] <- sqrt(mean(((actual[,1]) - (temp.pred))^2))
+}
+cv.gam.2 <- mean(MSE.list.2.df)
+```
+
+### 3 Degrees of Freedom
+
+The only nonparametric term is total square feet.
+
+
+```{r gam-3-df}
+MSE.list.3.df <- c()
+for(i in 1:10){
+  temp.train <- gam.train[gam.train$Fold != i, ]%>%dplyr::select(-c(Fold))
+  temp.test <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(-c(Fold, SalePrice))
+  actual <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(SalePrice)
+  temp.model.3.df <- gam(SalePrice ~  LotFrontage + LotArea + YearRemodAdd + XOnestFlrSF + XTwondFlrSF + BedroomAbvGr+ TotRmsAbvGrd + YrSold + s(totalsf, 3) + MSZoningCAll + MSZoningRL + StreetGrvl + AlleyGrvl + LotShapeIRThree + NeighborhoodBlmngtn + NeighborhoodBrDale + NeighborhoodEdwards + NeighborhoodGilbert + NeighborhoodMeadowV + NeighborhoodMitchel + NeighborhoodNoRidge + NeighborhoodNPkVill + NeighborhoodOldTown + NeighborhoodSawyer + NeighborhoodSomerst + NeighborhoodStoneBr + NeighborhoodSWISU + NeighborhoodTimber + ConditionOneNorm + ConditionOnePosA + ConditionOneRRAn + ConditionOneRRNn + ConditionTwoNorm + BldgTypeTwofmCon + BldgTypeDuplex + RoofStyleFlat + RoofStyleGable + RoofMatlCompShg + RoofMatlTarGrv + RoofMatlWdShake + RoofMatlWdShngl + ExteriorOnestWdSdng + ExteriorTwondAsbShng + ExteriorTwondBrkFace + ExteriorTwondCmentBd + ExteriorTwondHdBoard + ExteriorTwondPlywood + ExteriorTwondWdSdng + ExterCondFa + FoundationBrkTil + FoundationPConc + BsmtCondGd + BsmtExposureAv + BsmtExposureGd + BsmtFinTypeOneALQ + BsmtFinTypeOneBLQ + BsmtFinTypeTwoALQ + BsmtFinSFTwo + HeatingGasA + HeatingGrav + HeatingQCEx + ElectricalFuseF + HalfBath + KitchenAbvGr + KitchenQualFa + FunctionalMajTwo + FunctionalMod + FireplaceQuPo + GarageTypeTwoTypes + GarageTypeBasment + GarageTypeBuiltIn + GarageTypeDetchd + GarageFinishFin + GarageQualTA + GarageCondFa + GarageCondTA + PavedDriveN + EnclosedPorch + ScreenPorch + FenceGdWo + SaleTypeCWD + SaleTypeNew + SaleConditionAlloca + StreetPave + LandContourLvl + LotConfigInside + LandSlopeSev + BldgTypeTwnhsE + HouseStyleSLvl + MasVnrTypeStone + BsmtQualTA + BsmtFinTypeOnenoBasement + CentralAirY + FireplaceQuTA + GarageTypenoGarage + GarageQualnoGarage + GarageCondnoGarage + FencenoFence, data = temp.train)
+  
+  temp.pred <- predict.lm(temp.model.3.df, temp.test)
+  MSE.list.3.df[i] <- sqrt(mean(((actual[,1]) - (temp.pred))^2))
+}
+cv.gam.3 <- mean(MSE.list.3.df)
+```
+### 4 Degrees of Freedom
+
+First floor square feet, year sold, and total square feet all have nonparametric terms. 
+
+
+```{r gam-4-df}
+MSE.list.4.df <- c()
+for(i in 1:10){
+  temp.train <- gam.train[gam.train$Fold != i, ]%>%dplyr::select(-c(Fold))
+  temp.test <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(-c(Fold, SalePrice))
+  actual <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(SalePrice)
+  temp.model.4.df <- gam(SalePrice ~  LotFrontage + LotArea + YearRemodAdd + s(XOnestFlrSF, 4) + XTwondFlrSF + BedroomAbvGr+ TotRmsAbvGrd + s(YrSold, 4) + s(totalsf, 4) + MSZoningCAll + MSZoningRL + StreetGrvl + AlleyGrvl + LotShapeIRThree + NeighborhoodBlmngtn + NeighborhoodBrDale + NeighborhoodEdwards + NeighborhoodGilbert + NeighborhoodMeadowV + NeighborhoodMitchel + NeighborhoodNoRidge + NeighborhoodNPkVill + NeighborhoodOldTown + NeighborhoodSawyer + NeighborhoodSomerst + NeighborhoodStoneBr + NeighborhoodSWISU + NeighborhoodTimber + ConditionOneNorm + ConditionOnePosA + ConditionOneRRAn + ConditionOneRRNn + ConditionTwoNorm + BldgTypeTwofmCon + BldgTypeDuplex + RoofStyleFlat + RoofStyleGable + RoofMatlCompShg + RoofMatlTarGrv + RoofMatlWdShake + RoofMatlWdShngl + ExteriorOnestWdSdng + ExteriorTwondAsbShng + ExteriorTwondBrkFace + ExteriorTwondCmentBd + ExteriorTwondHdBoard + ExteriorTwondPlywood + ExteriorTwondWdSdng + ExterCondFa + FoundationBrkTil + FoundationPConc + BsmtCondGd + BsmtExposureAv + BsmtExposureGd + BsmtFinTypeOneALQ + BsmtFinTypeOneBLQ + BsmtFinTypeTwoALQ + BsmtFinSFTwo + HeatingGasA + HeatingGrav + HeatingQCEx + ElectricalFuseF + HalfBath + KitchenAbvGr + KitchenQualFa + FunctionalMajTwo + FunctionalMod + FireplaceQuPo + GarageTypeTwoTypes + GarageTypeBasment + GarageTypeBuiltIn + GarageTypeDetchd + GarageFinishFin + GarageQualTA + GarageCondFa + GarageCondTA + PavedDriveN + EnclosedPorch + ScreenPorch + FenceGdWo + SaleTypeCWD + SaleTypeNew + SaleConditionAlloca + StreetPave + LandContourLvl + LotConfigInside + LandSlopeSev + BldgTypeTwnhsE + HouseStyleSLvl + MasVnrTypeStone + BsmtQualTA + BsmtFinTypeOnenoBasement + CentralAirY + FireplaceQuTA + GarageTypenoGarage + GarageQualnoGarage + GarageCondnoGarage + FencenoFence, data = temp.train)
+  
+  temp.pred <- predict.lm(temp.model.4.df, temp.test)
+  MSE.list.4.df[i] <- sqrt(mean(((actual[,1]) - (temp.pred))^2))
+}
+cv.gam.4 <- mean(MSE.list.4.df)
+```
+### Five degrees of freedom
+
+Lot area, year remodel added, first floor square feet, bedrooms above ground, year sold, and total square feet all have nonparametric terms added.
+
+
+```{r gam-5-df}
+MSE.list.5.df <- c()
+for(i in 1:10){
+  temp.train <- gam.train[gam.train$Fold != i, ]%>%dplyr::select(-c(Fold))
+  temp.test <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(-c(Fold, SalePrice))
+  actual <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(SalePrice)
+  temp.model.5.df <- gam(SalePrice ~  LotFrontage + s(LotArea, 5) + s(YearRemodAdd, 5) + s(XOnestFlrSF, 5) + XTwondFlrSF + s(BedroomAbvGr, 5)+ TotRmsAbvGrd + s(YrSold, 5) + s(totalsf, 5) + MSZoningCAll + MSZoningRL + StreetGrvl + AlleyGrvl + LotShapeIRThree + NeighborhoodBlmngtn + NeighborhoodBrDale + NeighborhoodEdwards + NeighborhoodGilbert + NeighborhoodMeadowV + NeighborhoodMitchel + NeighborhoodNoRidge + NeighborhoodNPkVill + NeighborhoodOldTown + NeighborhoodSawyer + NeighborhoodSomerst + NeighborhoodStoneBr + NeighborhoodSWISU + NeighborhoodTimber + ConditionOneNorm + ConditionOnePosA + ConditionOneRRAn + ConditionOneRRNn + ConditionTwoNorm + BldgTypeTwofmCon + BldgTypeDuplex + RoofStyleFlat + RoofStyleGable + RoofMatlCompShg + RoofMatlTarGrv + RoofMatlWdShake + RoofMatlWdShngl + ExteriorOnestWdSdng + ExteriorTwondAsbShng + ExteriorTwondBrkFace + ExteriorTwondCmentBd + ExteriorTwondHdBoard + ExteriorTwondPlywood + ExteriorTwondWdSdng + ExterCondFa + FoundationBrkTil + FoundationPConc + BsmtCondGd + BsmtExposureAv + BsmtExposureGd + BsmtFinTypeOneALQ + BsmtFinTypeOneBLQ + BsmtFinTypeTwoALQ + BsmtFinSFTwo + HeatingGasA + HeatingGrav + HeatingQCEx + ElectricalFuseF + HalfBath + KitchenAbvGr + KitchenQualFa + FunctionalMajTwo + FunctionalMod + FireplaceQuPo + GarageTypeTwoTypes + GarageTypeBasment + GarageTypeBuiltIn + GarageTypeDetchd + GarageFinishFin + GarageQualTA + GarageCondFa + GarageCondTA + PavedDriveN + EnclosedPorch + ScreenPorch + FenceGdWo + SaleTypeCWD + SaleTypeNew + SaleConditionAlloca + StreetPave + LandContourLvl + LotConfigInside + LandSlopeSev + BldgTypeTwnhsE + HouseStyleSLvl + MasVnrTypeStone + BsmtQualTA + BsmtFinTypeOnenoBasement + CentralAirY + FireplaceQuTA + GarageTypenoGarage + GarageQualnoGarage + GarageCondnoGarage + FencenoFence, data = temp.train)
+  
+  temp.pred <- predict.lm(temp.model.5.df, temp.test)
+  MSE.list.5.df[i] <- sqrt(mean(((actual[,1]) - (temp.pred))^2))
+}
+cv.gam.5 <- mean(MSE.list.5.df)
+```
+
+
+### Six degrees of freedom
+
+Lot area, year remodel added, first floor square feet, second floor square feet, bedrooms above ground, year sold, and total square feet all have nonparametric terms added.
+
+
+```{r gam-6-df}
+MSE.list.6.df <- c()
+for(i in 1:10){
+  temp.train <- gam.train[gam.train$Fold != i, ]%>%dplyr::select(-c(Fold))
+  temp.test <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(-c(Fold, SalePrice))
+  actual <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(SalePrice)
+  temp.model.6.df <- gam(SalePrice ~  LotFrontage + s(LotArea, 6) + s(YearRemodAdd, 6) + s(XOnestFlrSF, 6) + s(XTwondFlrSF, 6) + s(BedroomAbvGr, 6)+ TotRmsAbvGrd + s(YrSold, 6) + s(totalsf, 6) + MSZoningCAll + MSZoningRL + StreetGrvl + AlleyGrvl + LotShapeIRThree + NeighborhoodBlmngtn + NeighborhoodBrDale + NeighborhoodEdwards + NeighborhoodGilbert + NeighborhoodMeadowV + NeighborhoodMitchel + NeighborhoodNoRidge + NeighborhoodNPkVill + NeighborhoodOldTown + NeighborhoodSawyer + NeighborhoodSomerst + NeighborhoodStoneBr + NeighborhoodSWISU + NeighborhoodTimber + ConditionOneNorm + ConditionOnePosA + ConditionOneRRAn + ConditionOneRRNn + ConditionTwoNorm + BldgTypeTwofmCon + BldgTypeDuplex + RoofStyleFlat + RoofStyleGable + RoofMatlCompShg + RoofMatlTarGrv + RoofMatlWdShake + RoofMatlWdShngl + ExteriorOnestWdSdng + ExteriorTwondAsbShng + ExteriorTwondBrkFace + ExteriorTwondCmentBd + ExteriorTwondHdBoard + ExteriorTwondPlywood + ExteriorTwondWdSdng + ExterCondFa + FoundationBrkTil + FoundationPConc + BsmtCondGd + BsmtExposureAv + BsmtExposureGd + BsmtFinTypeOneALQ + BsmtFinTypeOneBLQ + BsmtFinTypeTwoALQ + BsmtFinSFTwo + HeatingGasA + HeatingGrav + HeatingQCEx + ElectricalFuseF + HalfBath + KitchenAbvGr + KitchenQualFa + FunctionalMajTwo + FunctionalMod + FireplaceQuPo + GarageTypeTwoTypes + GarageTypeBasment + GarageTypeBuiltIn + GarageTypeDetchd + GarageFinishFin + GarageQualTA + GarageCondFa + GarageCondTA + PavedDriveN + EnclosedPorch + ScreenPorch + FenceGdWo + SaleTypeCWD + SaleTypeNew + SaleConditionAlloca + StreetPave + LandContourLvl + LotConfigInside + LandSlopeSev + BldgTypeTwnhsE + HouseStyleSLvl + MasVnrTypeStone + BsmtQualTA + BsmtFinTypeOnenoBasement + CentralAirY + FireplaceQuTA + GarageTypenoGarage + GarageQualnoGarage + GarageCondnoGarage + FencenoFence, data = temp.train)
+  
+  temp.pred <- predict.lm(temp.model.6.df, temp.test)
+  MSE.list.6.df[i] <- sqrt(mean(((actual[,1]) - (temp.pred))^2))
+}
+cv.gam.6 <- mean(MSE.list.6.df)
+```
+
+
+### Seven degrees of freedom
+
+Lot area, year remodel added, first floor square feet, second floor square feet, bedrooms above ground, year sold, and total square feet all have nonparametric terms added.
+
+
+```{r gam-7-df}
+MSE.list.7.df <- c()
+for(i in 1:10){
+  temp.train <- gam.train[gam.train$Fold != i, ]%>%dplyr::select(-c(Fold))
+  temp.test <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(-c(Fold, SalePrice))
+  actual <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(SalePrice)
+  temp.model.7.df <- gam(SalePrice ~  LotFrontage + s(LotArea, 7) + s(YearRemodAdd, 7) + s(XOnestFlrSF, 7) + s(XTwondFlrSF, 7) + s(BedroomAbvGr, 7)+ TotRmsAbvGrd + s(YrSold, 7) + s(totalsf, 7) + MSZoningCAll + MSZoningRL + StreetGrvl + AlleyGrvl + LotShapeIRThree + NeighborhoodBlmngtn + NeighborhoodBrDale + NeighborhoodEdwards + NeighborhoodGilbert + NeighborhoodMeadowV + NeighborhoodMitchel + NeighborhoodNoRidge + NeighborhoodNPkVill + NeighborhoodOldTown + NeighborhoodSawyer + NeighborhoodSomerst + NeighborhoodStoneBr + NeighborhoodSWISU + NeighborhoodTimber + ConditionOneNorm + ConditionOnePosA + ConditionOneRRAn + ConditionOneRRNn + ConditionTwoNorm + BldgTypeTwofmCon + BldgTypeDuplex + RoofStyleFlat + RoofStyleGable + RoofMatlCompShg + RoofMatlTarGrv + RoofMatlWdShake + RoofMatlWdShngl + ExteriorOnestWdSdng + ExteriorTwondAsbShng + ExteriorTwondBrkFace + ExteriorTwondCmentBd + ExteriorTwondHdBoard + ExteriorTwondPlywood + ExteriorTwondWdSdng + ExterCondFa + FoundationBrkTil + FoundationPConc + BsmtCondGd + BsmtExposureAv + BsmtExposureGd + BsmtFinTypeOneALQ + BsmtFinTypeOneBLQ + BsmtFinTypeTwoALQ + BsmtFinSFTwo + HeatingGasA + HeatingGrav + HeatingQCEx + ElectricalFuseF + HalfBath + KitchenAbvGr + KitchenQualFa + FunctionalMajTwo + FunctionalMod + FireplaceQuPo + GarageTypeTwoTypes + GarageTypeBasment + GarageTypeBuiltIn + GarageTypeDetchd + GarageFinishFin + GarageQualTA + GarageCondFa + GarageCondTA + PavedDriveN + EnclosedPorch + ScreenPorch + FenceGdWo + SaleTypeCWD + SaleTypeNew + SaleConditionAlloca + StreetPave + LandContourLvl + LotConfigInside + LandSlopeSev + BldgTypeTwnhsE + HouseStyleSLvl + MasVnrTypeStone + BsmtQualTA + BsmtFinTypeOnenoBasement + CentralAirY + FireplaceQuTA + GarageTypenoGarage + GarageQualnoGarage + GarageCondnoGarage + FencenoFence, data = temp.train)
+  
+  temp.pred <- predict.lm(temp.model.7.df, temp.test)
+  MSE.list.7.df[i] <- sqrt(mean(((actual[,1]) - (temp.pred))^2))
+}
+cv.gam.7 <- mean(MSE.list.7.df)
+```
+
+### Eight degrees of freedom
+
+Lot frontage, lot area, year remodel added, first floor square feet, second floor square feet, bedrooms above ground, year sold, and total square feet all have nonparametric terms added.
+
+
+```{r gam-8-df}
+MSE.list.8.df <- c()
+for(i in 1:10){
+  temp.train <- gam.train[gam.train$Fold != i, ]%>%dplyr::select(-c(Fold))
+  temp.test <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(-c(Fold, SalePrice))
+  actual <- gam.train[gam.train$Fold == i, ]%>%dplyr::select(SalePrice)
+  temp.model.8.df <- gam(SalePrice ~  s(LotFrontage, 8) + s(LotArea, 8) + s(YearRemodAdd, 8) + s(XOnestFlrSF, 8) + s(XTwondFlrSF, 8) + s(BedroomAbvGr, 8)+ TotRmsAbvGrd + s(YrSold, 8) + s(totalsf, 8) + MSZoningCAll + MSZoningRL + StreetGrvl + AlleyGrvl + LotShapeIRThree + NeighborhoodBlmngtn + NeighborhoodBrDale + NeighborhoodEdwards + NeighborhoodGilbert + NeighborhoodMeadowV + NeighborhoodMitchel + NeighborhoodNoRidge + NeighborhoodNPkVill + NeighborhoodOldTown + NeighborhoodSawyer + NeighborhoodSomerst + NeighborhoodStoneBr + NeighborhoodSWISU + NeighborhoodTimber + ConditionOneNorm + ConditionOnePosA + ConditionOneRRAn + ConditionOneRRNn + ConditionTwoNorm + BldgTypeTwofmCon + BldgTypeDuplex + RoofStyleFlat + RoofStyleGable + RoofMatlCompShg + RoofMatlTarGrv + RoofMatlWdShake + RoofMatlWdShngl + ExteriorOnestWdSdng + ExteriorTwondAsbShng + ExteriorTwondBrkFace + ExteriorTwondCmentBd + ExteriorTwondHdBoard + ExteriorTwondPlywood + ExteriorTwondWdSdng + ExterCondFa + FoundationBrkTil + FoundationPConc + BsmtCondGd + BsmtExposureAv + BsmtExposureGd + BsmtFinTypeOneALQ + BsmtFinTypeOneBLQ + BsmtFinTypeTwoALQ + BsmtFinSFTwo + HeatingGasA + HeatingGrav + HeatingQCEx + ElectricalFuseF + HalfBath + KitchenAbvGr + KitchenQualFa + FunctionalMajTwo + FunctionalMod + FireplaceQuPo + GarageTypeTwoTypes + GarageTypeBasment + GarageTypeBuiltIn + GarageTypeDetchd + GarageFinishFin + GarageQualTA + GarageCondFa + GarageCondTA + PavedDriveN + EnclosedPorch + ScreenPorch + FenceGdWo + SaleTypeCWD + SaleTypeNew + SaleConditionAlloca + StreetPave + LandContourLvl + LotConfigInside + LandSlopeSev + BldgTypeTwnhsE + HouseStyleSLvl + MasVnrTypeStone + BsmtQualTA + BsmtFinTypeOnenoBasement + CentralAirY + FireplaceQuTA + GarageTypenoGarage + GarageQualnoGarage + GarageCondnoGarage + FencenoFence, data = temp.train)
+  
+  temp.pred <- predict.lm(temp.model.8.df, temp.test)
+  MSE.list.8.df[i] <- sqrt(mean(((actual[,1]) - (temp.pred))^2))
+}
+cv.gam.8 <- mean(MSE.list.8.df)
+```
+
+## Degrees of Freedom Summary
+
+```{r gam-df-summary}
+errors <- c(cv.gam.2, cv.gam.3, cv.gam.4, cv.gam.5, cv.gam.6, cv.gam.7, cv.gam.8)
+df <- 2:8
+
+plot(df, errors,
+     xlab = "Degrees of Freedom",
+     ylab = "10 Fold CV RMSE")
+```
+
+So, with more flexibility comes more error. This is likely because the model is overfitting the data with more flexibility.
+
+Moving forward, I will use the model with 4 degrees of freedom, because this model has the lowest CV RMSE.
+
+## Estimated Test Error
+
+The estimated test error was already calculated above, and is:
+
+```{r gam-cv-error}
+cv.gam.4
+```
+
+## Interpretation
+
+Here is the final model. Note that I removed the nonparametric term for YrSold, because it turned out it wasn't significant in the model. I suspect that this was only significant because I included smoothing terms for every quantitative predictor. And, now that I'm only using smoothing terms for a few predictors, it because insignificant. 
+
+```{r interpret-gam}
+gam.model <- gam(SalePrice ~  LotFrontage + LotArea + YearRemodAdd + s(XOnestFlrSF, 4) + XTwondFlrSF + BedroomAbvGr+ TotRmsAbvGrd + YrSold + s(totalsf, 4) + MSZoningCAll + MSZoningRL + StreetGrvl + AlleyGrvl + LotShapeIRThree + NeighborhoodBlmngtn + NeighborhoodBrDale + NeighborhoodEdwards + NeighborhoodGilbert + NeighborhoodMeadowV + NeighborhoodMitchel + NeighborhoodNoRidge + NeighborhoodNPkVill + NeighborhoodOldTown + NeighborhoodSawyer + NeighborhoodSomerst + NeighborhoodStoneBr + NeighborhoodSWISU + NeighborhoodTimber + ConditionOneNorm + ConditionOnePosA + ConditionOneRRAn + ConditionOneRRNn + ConditionTwoNorm + BldgTypeTwofmCon + BldgTypeDuplex + RoofStyleFlat + RoofStyleGable + RoofMatlCompShg + RoofMatlTarGrv + RoofMatlWdShake + RoofMatlWdShngl + ExteriorOnestWdSdng + ExteriorTwondAsbShng + ExteriorTwondBrkFace + ExteriorTwondCmentBd + ExteriorTwondHdBoard + ExteriorTwondPlywood + ExteriorTwondWdSdng + ExterCondFa + FoundationBrkTil + FoundationPConc + BsmtCondGd + BsmtExposureAv + BsmtExposureGd + BsmtFinTypeOneALQ + BsmtFinTypeOneBLQ + BsmtFinTypeTwoALQ + BsmtFinSFTwo + HeatingGasA + HeatingGrav + HeatingQCEx + ElectricalFuseF + HalfBath + KitchenAbvGr + KitchenQualFa + FunctionalMajTwo + FunctionalMod + FireplaceQuPo + GarageTypeTwoTypes + GarageTypeBasment + GarageTypeBuiltIn + GarageTypeDetchd + GarageFinishFin + GarageQualTA + GarageCondFa + GarageCondTA + PavedDriveN + EnclosedPorch + ScreenPorch + FenceGdWo + SaleTypeCWD + SaleTypeNew + SaleConditionAlloca + StreetPave + LandContourLvl + LotConfigInside + LandSlopeSev + BldgTypeTwnhsE + HouseStyleSLvl + MasVnrTypeStone + BsmtQualTA + BsmtFinTypeOnenoBasement + CentralAirY + FireplaceQuTA + GarageTypenoGarage + GarageQualnoGarage + GarageCondnoGarage + FencenoFence, data = gam.train)
+```
+
+```{r summary-gam}
+summary.gam <- summary(gam.model)
+summary.gam
+```
+
+```{r gam-significant-predictors}
+table(summary.gam$parametric.anova[,5] < 0.05)
+```
+64 of the predictor's have a significant p-value in the model for the parametric anova, while 30 do not.
+
+However, I still choose this to be my final model, simply because these predictors were chosen via the best subset selection earlier. 
+
+```{r visualize-gam}
+par(mfrow = c(2,2))
+plot(gam.model)
+```
+
+Though these graphs are compressed to save space, some meaningful relationships can still be observed.
+
+For example, you can clearly see the nonlinear relationship in total square feet. And, we can also interpret the partials for the qualitative predictors. For example, houses in the Gilbert neighborhood is associated with a lower partial. And, having central air is associated with a high partial than not having central air. 
+
+## Predictions
+
+```{r predict-gam}
+gam.predictions <-predict(gam.model, newdata = test.final)
+```
+
+# Before Submitting To Kaggle...
+
+Before submitting to Kaggle, I thought the best method would be boosting, because it has the lowest cross validation error. However, this CV error is suspiciously low. Though I used the same method to compute estimated RMSE, it is possible I made a computational error. 
+
+```{r test-error-summary}
+test_error = c(cv.rmse.linear, cv.rmse.knn, cv.rmse.bestsubset, cv.rmse.lasso, cv.rmse.ridge, cv.rmse.regression.tree, cv.rmse.random.forest, cv.rmse.boost, cv.rmse.bagging, cv.gam.4)
+
+test_error
+```
+
+
+# Kaggle
+
+Create data frames to export the predictions for each method to a .csv file. Then, submit these predictions to Kaggle. 
+
+```{r eval = FALSE}
+knn.pred.final <- data.frame(SalePrice = knn.pred)
+rownames(knn.pred.final) = seq(1461, 2919)
+write.csv(knn.pred.final,'knnPredictionsFinal.csv')
+
+lm.pred.final <- data.frame(SalePrice = lm.pred)
+rownames(lm.pred.final) = seq(1461, 2919)
+write.csv(lm.pred.final,'lmPredictionsFinal.csv')
+
+lasso.pred.final <- data.frame(SalePrice = lasso.pred)
+rownames(lasso.pred.final) = seq(1461, 2919)
+write.csv(lasso.pred.final,'lassoPredictionsFinal.csv')
+
+ridge.pred.final <- data.frame(SalePrice = ridge.pred)
+rownames(ridge.pred.final) = seq(1461, 2919)
+write.csv(ridge.pred.final,'ridgePredictionsFinal.csv')
+
+bestsubset.pred.final <- data.frame(SalePrice = pred.best.subset)
+rownames(bestsubset.pred.final) = seq(1461, 2919)
+write.csv(bestsubset.pred.final,'bestsubsetPredictionsFinal.csv')
+
+gam.pred.final <- data.frame(SalePrice = exp(gam.predictions))
+rownames(gam.pred.final) = seq(1461, 2919)
+write.csv(gam.pred.final,'gamPredictionsFinal.csv')
+
+
+boost.pred.final <- data.frame(SalePrice = exp(boost.pred))
+rownames(boost.pred.final) = seq(1461, 2919)
+write.csv(boost.pred.final,'boostPredictionsFinal.csv')
+
+bagging.pred.final <- data.frame(SalePrice = exp(bag.predictions))
+rownames(bagging.pred.final) = seq(1461, 2919)
+write.csv(bagging.pred.final,'baggingPredictionsFinal.csv')
+
+randomforest.pred.final <- data.frame(SalePrice = exp(random.forest.pred))
+rownames(randomforest.pred.final) = seq(1461, 2919)
+write.csv(randomforest.pred.final,'randomForestPredictionsFinal.csv')
+
+regressionTree.pred.final <- data.frame(SalePrice = regression.tree.predictions)
+rownames(regressionTree.pred.final) = seq(1461, 2919)
+write.csv(regressionTree.pred.final,'regressionTreePredictionsFinal.csv')
+
+```
+
+Here are my errors from Kaggle:
+
+```{r, out.width="90%", out.height="90%"}
+knitr::include_graphics("FinalKaggle1.PNG")
+knitr::include_graphics("FinalKaggle2.PNG")
+
+```
+
+This puts me at 1197 out of 5759 submissions. 
+
+# Discussion
+
+The method that performed the best was the boosting model. It makes sense that boosting performed better than the regression tree, because boosting is an approach to improve prediction results from a decision tree. And, boosting is a "slow" learner, so it's able to avoid overfitting the data, which may have been an issue that the Random Forest method encountered. 
+
+The method that performed the worst is the regression tree. I suspect this is because regression trees can be unstable, so any small change in the data would have changed the tree and led to different predictions. And bagging, boosting, and random forest methods grow a "forest" of trees rather than just one tree, so it makes sense that this single regression tree performed worse than these methods. Not only that, but it is difficult to get accurate predictions for a continuous variable using a regression tree, because the possible SalePrice values took only 9 or 10 different values, while there is a wide range of continuous values that the sale price actually took.
+
+In addition to the regression tree, KNN performed poorly. This is likely due to the dimensionality of the data. It is hard finding "nearest neighbors" when you have to match up 250 attributes. 
+
+# Summary
+
+In summary, I applied a range of machine learning methods to predict the sale price of houses in Ames, Iowa. After cleaning the data, I applied both linear and tree based methods to the data. Ultimately, the most accurate model was the boosting model, while regression trees and KNN performed poorly. 
+
+Here is a comparison of my estimated test errors with the true errors from Kaggle. I also calculated the prediction accuracy for each method:
+
+```{r final-summary}
+temp <- data.frame(method = c("Linear Regression", "KNN", "Subset Selection", "Lasso", "Ridge", "Regression Tree", "Random Forest", "Boosting", "Bagging", "GAM"),
+              test_error = c(cv.rmse.linear, cv.rmse.knn, cv.rmse.bestsubset, cv.rmse.lasso, cv.rmse.ridge, cv.rmse.regression.tree, cv.rmse.random.forest, cv.rmse.boost, cv.rmse.bagging, cv.gam.4),
+              true_error = c(0.14923, 0.20726, 0.18235, 0.13762 ,0.14420, 0.22431, 0.14272, 0.12485, 0.14691, 0.17460),
+              prediction_accuracy = 0.12 / c(0.14923, 0.20726, 0.18235, 0.13762 ,0.14420, 0.22431, 0.14272, 0.12485, 0.14691, 0.17460)*10)
+
+
+kable(temp,
+      col.names = c("Method", "CV Error", "Kaggle True Error", "Prediction Accuracy Score"))
+```
+
+The lowest prediction accuracy I achieved is with the boosting method, which gives me a total of 9.611534.
+
+The test errors I calculated through cross-validation are very similar to the errors assigned by Kaggle. The notable exception is the boosting model; clearly, the model I created using the training set is overfitting the data. Either that, or I have an error in my calculations, though I used the same method to calculate estimated test error across all methods. 
+
+Future directions of this project could be devoting more time on the tuning parameters for the boosting, bagging, and random forest methods. I was limited in doing this because of the sheer amount of time that cross-fold validation takes when building models with thousands of trees. However, I think my model can be further improved if I can tune the number of trees, the tuning parameter, and the number of predictors to try more precisely. While I attempted to tune the number of trees, I did not see an obvious local minimum in error. If I expand to include more trees, I suspect I will reach this local minimum.
+
+Further, I am confused why the linear model performed better than the best subset selection model. This is clearly opposite of what is expected. Perhaps I removed a significant predictor of sale price; this, too, should be investigated further. 
+
+# Conclusion 
+
+In conclusion, I successfully created multiple models to predict sale price. While not all were accurate predictors of sale price, some models were able to accurately predict sale price and yielded a low error rate. 
+
+# Further Questions
+
+Further questions raised by the study, that can be investigated in the future, include:
+
+1. Are the important predictors of sale price in Ames, Iowa also important predictors in other cities? And, do we see a difference in important predictors when we compare urban and suburban areas to rural areas?
+
+2. How has the housing market crash of 2008 influenced house sale prices? Will taking into account financial factors, such as unemployment or GDP, as predictors lead to better predictions?
+
+3. Can the results of this study be applied to different years, once inflation is taken into account?
+
+
+
+
+
+
+
+
+
